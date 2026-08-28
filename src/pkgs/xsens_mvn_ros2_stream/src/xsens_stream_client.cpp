@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xsens_mvn_ros2_stream/xsens_stream_client.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -116,19 +117,63 @@ bool XsensStreamClient::buildXsensModel()
   auto joint_angles_datagram = waitForJointAnglesDatagram();
 
   // Get links
+  //
+  // Segment IDs 1..23 are the standard body model, indexed
+  // directly into xsens_model_names.links 
+  // Any segments beyond that are assumed to be MANUS finger-tracking data, 
+  // appended by MVN as [left hand block][right hand block]
+  // Each hand block is 20 segments (5 fingers x 4 phalanges)
+  constexpr int kBodySegmentCount = 23;
+
   RCLCPP_INFO(
     m_logger, "Building model: %zu links available.",
     quaternion_datagram.getData().size());
+
+  const int total_segments = static_cast<int>(quaternion_datagram.getData().size());
+  const int extra_segments = std::max(0, total_segments - kBodySegmentCount);
+  const int segments_per_hand = extra_segments / 2;
+  if (extra_segments % 2 != 0) {
+    RCLCPP_WARN(
+      m_logger,
+      "Received %d segments beyond the standard %d-segment body model (odd number) "
+      "so the left/right hand split below is likely wrong.",
+      extra_segments, kBodySegmentCount);
+  }
+  if (segments_per_hand > 0) {
+    RCLCPP_INFO(
+      m_logger, "MANUS gloves finger tracking data detected: %d segments per hand.",
+      segments_per_hand);
+  }
+
   for (const auto & xsens_link : quaternion_datagram.getData()) {
-    if (!m_humanData->setLink(
-          xsens_model_names.links[xsens_link.segmentId],
-          xsens_mvn_ros2::Link(xsens_model_names.links[xsens_link.segmentId])))
+    const int segment_id = xsens_link.segmentId;
+    std::string link_name;
+
+    if (segment_id >= 1 && segment_id <= kBodySegmentCount) {
+      link_name = xsens_model_names.links[segment_id];
+    } else if (
+      segments_per_hand > 0 && segment_id > kBodySegmentCount &&
+      segment_id <= kBodySegmentCount + 2 * segments_per_hand)
     {
+      const int offset = segment_id - kBodySegmentCount - 1;  // 0-based, both hands
+      const bool is_left = offset < segments_per_hand;
+      const int position = is_left ? offset : offset - segments_per_hand;
+      link_name = fingerSegmentName(is_left ? "left" : "right", position);
+    } else {
+      RCLCPP_WARN(
+        m_logger,
+        "Segment ID %d is outside the known body/finger model range "
+        "(%d total segments this frame); skipping.",
+        segment_id, total_segments);
+      continue;
+    }
+
+    if (!m_humanData->setLink(link_name, xsens_mvn_ros2::Link(link_name))) {
       RCLCPP_ERROR(m_logger, "Error inserting link '%s'. Aborting model build.",
-        xsens_model_names.links[xsens_link.segmentId].c_str());
+        link_name.c_str());
       return false;
     } else {
-      m_linkNameList.push_back(xsens_model_names.links[xsens_link.segmentId]);
+      m_linkNameList.push_back(link_name);
     }
   }
   if (m_humanData->getLinks().empty()) {
